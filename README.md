@@ -2,6 +2,30 @@
 
 A secure online storage system with robust user authentication, file encryption, access control, and activity auditing features.
 
+## Architecture Overview
+While the code is organized in modules, it implements a client-server architecture where:
+
+### Client Components (`client_menu.py`)
+- Handles user interface and interactions
+- Manages client-side encryption before file upload
+- Handles file decryption after download
+- Provides user authentication interface
+- Current implementation runs in the same process for demonstration purposes
+
+### Server Components
+- `userManager.py`: Handles user authentication and management
+- `file_manager.py`: Manages file storage and retrieval
+- `encryption_module.py`: Provides encryption services
+- `mfa.py`: Handles multi-factor authentication
+- Current implementation is integrated for simplicity and demonstration
+
+### Note on Implementation
+While the current implementation combines client and server components for simplicity and demonstration purposes, the code is structured to allow easy separation into distinct client and server programs. The modular design ensures that:
+
+1. Client operations (UI, file handling) are separate from server operations (storage, authentication)
+2. Security measures are properly implemented as if running on separate machines
+3. The code can be easily modified to run as separate client and server programs if needed
+
 ## Core Functionalities
 
 ### 1. User Management
