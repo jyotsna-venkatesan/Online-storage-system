@@ -3,108 +3,187 @@ import hashlib
 import re
 import secrets
 import string
-from typing import Optional, Tuple, Dict, Any, Union, List
-from datetime import datetime
 import logging
+from typing import Optional, Tuple, Dict, Any, Union, List, TypedDict, Protocol, Generator, Literal
+from sqlite3.dbapi2 import Connection, Cursor
+from datetime import datetime, timedelta
 from contextlib import contextmanager
 
-logging.basicConfig(level=logging.INFO)
+class DatabaseCursor(Protocol):
+    def execute(self, query: str, params: Union[Tuple[Any, ...], Dict[str, Any]] = ...) -> Any: ...
+    def fetchone(self) -> Optional[sqlite3.Row]: ...
+    def fetchall(self) -> List[sqlite3.Row]: ...
+    @property
+    def lastrowid(self) -> int: ...
+
+class DatabaseConnection(Protocol):
+    def cursor(self) -> DatabaseCursor: ...
+    def commit(self) -> None: ...
+    def rollback(self) -> None: ...
+    def close(self) -> None: ...
+    def row_factory(self) -> Any: ...
+
+class UserData(TypedDict):
+    id: int
+    username: str
+    is_admin: bool
+    password_hash: str
+    salt: str
+    failed_attempts: int
+    locked_until: Optional[str]
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+class DatabaseError(Exception):
+    """Custom exception for database errors"""
+    pass
 
 class UserManager:
-    def __init__(self, db_name: str = 'secure_storage.db') -> None:
+    def __init__(self, db_name: str = 'secure_storage.db'):
         self.db_name: str = db_name
-        self.conn: Optional[sqlite3.Connection] = sqlite3.connect(self.db_name)
-        self.cursor: Optional[sqlite3.Cursor] = self.conn.cursor()
-
-        # Security parameters
-        self.min_password_length: int = 7
+        self.min_password_length: int = 8
         self.salt_length: int = 32
         self._hash_iterations: int = 100000
         self.hash_algorithm: str = 'sha256'
-
-        self.current_user: Optional[Dict[str, Any]] = None
+        self.current_user: Optional[Dict[str, Any]] = None  # Changed from UserData
         self.session_token: Optional[str] = None
-
+        self.connection: Optional[sqlite3.Connection] = None
+        self.cursor: Optional[sqlite3.Cursor] = None
+        self._connect_db()
         self._initialize_db()
 
-    def _initialize_db(self) -> None:
-        """Initialize database and create tables if they don't exist."""
-        queries = [
-            '''CREATE TABLE IF NOT EXISTS users (
-                   id INTEGER PRIMARY KEY AUTOINCREMENT,
-                   username TEXT UNIQUE NOT NULL,
-                   password_hash TEXT NOT NULL,
-                   salt TEXT NOT NULL,
-                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                   last_login TIMESTAMP,
-                   failed_attempts INTEGER DEFAULT 0,
-                   locked_until TIMESTAMP
-               )''',
-            '''CREATE TABLE IF NOT EXISTS password_reset_tokens (
-                   id INTEGER PRIMARY KEY AUTOINCREMENT,
-                   user_id INTEGER NOT NULL,
-                   token TEXT NOT NULL,
-                   expires_at TIMESTAMP NOT NULL,
-                   used INTEGER DEFAULT 0,
-                   FOREIGN KEY(user_id) REFERENCES users(id)
-               )''',
-            '''CREATE TABLE IF NOT EXISTS activity_log (
-                   id INTEGER PRIMARY KEY AUTOINCREMENT,
-                   user_id INTEGER,
-                   activity_type TEXT NOT NULL,
-                   timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                   ip_address TEXT,
-                   details TEXT,
-                   FOREIGN KEY(user_id) REFERENCES users(id)
-               )'''
-        ]
-        for query in queries:
-            self._execute(query)
+    def _connect_db(self) -> None:
+        """Establish database connection"""
+        try:
+            conn = sqlite3.connect(self.db_name)
+            if conn is None:
+                raise DatabaseError("Failed to create database connection")
+            conn.row_factory = sqlite3.Row
+            self.connection = conn
+            self.cursor = conn.cursor()
+            if self.cursor is None:
+                raise DatabaseError("Failed to create database cursor")
+        except sqlite3.Error as e:
+            logging.error(f"Database connection error: {e}")
+            raise DatabaseError(f"Failed to connect to database: {e}")
 
     @contextmanager
-    def _db_transaction(self):
-        """
-        Context manager to handle database transactions.
-        Commits on successful exit; rolls back on exception.
-        """
+    def _transaction(self) -> Generator[sqlite3.Cursor, None, None]:
+        """Context manager for database transactions"""
+        if self.connection is None or self.cursor is None:
+            self._connect_db()
+        if self.connection is None or self.cursor is None:
+            raise DatabaseError("Database connection not established")
         try:
-            yield
-            self.conn.commit()
-        except sqlite3.Error as e:
-            self.conn.rollback()
-            logging.error("Database error: %s", e)
+            yield self.cursor
+            if self.connection is not None:
+                self.connection.commit()
+        except Exception as e:
+            if self.connection is not None:
+                self.connection.rollback()
+            logging.error(f"Transaction error: {e}")
             raise
 
-    def _execute(self, query: str, params: Union[Tuple, List] = ()) -> None:
-        """Execute a query within a transaction."""
+    def _initialize_db(self) -> None:
+        """Initialize database tables"""
         if self.cursor is None:
-            raise RuntimeError("Database cursor not initialized")
-        with self._db_transaction():
-            self.cursor.execute(query, params)
+            raise DatabaseError("Database cursor not initialized")
 
-    def _fetchone(self) -> Optional[Tuple]:
-        """Fetch one row from the cursor."""
-        if self.cursor is None:
-            raise RuntimeError("Database cursor not initialized")
-        return self.cursor.fetchone()
+        tables = [
+            '''CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                is_admin INTEGER DEFAULT 0,  -- Changed BOOLEAN to INTEGER
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP,
+                failed_attempts INTEGER DEFAULT 0,
+                locked_until TIMESTAMP
+            )''',
+            '''CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                filename TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                encryption_key TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(owner_id) REFERENCES users(id)
+            )''',
+            '''CREATE TABLE IF NOT EXISTS file_shares (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL,
+                shared_with_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(file_id) REFERENCES files(id),
+                FOREIGN KEY(shared_with_id) REFERENCES users(id)
+            )''',
+            '''CREATE TABLE IF NOT EXISTS activity_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                activity_type TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                details TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )''',
+            '''CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token TEXT NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                used BOOLEAN DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )''',
+            '''CREATE TABLE IF NOT EXISTS mfa_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                used BOOLEAN DEFAULT 0,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )''',
+            '''CREATE TABLE IF NOT EXISTS mfa_settings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        secret_key TEXT NOT NULL,
+                        email TEXT NOT NULL,
+                        enabled BOOLEAN DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY(user_id) REFERENCES users(id)
+                    )'''
+        ]
 
-    def _log_activity(self, user_id: int, activity_type: str, ip_address: Optional[str] = None, details: Optional[str] = None) -> None:
-        """Log user activity for auditing purposes."""
         try:
-            self._execute(
-                '''INSERT INTO activity_log (user_id, activity_type, ip_address, details)
-                   VALUES (?, ?, ?, ?)''',
-                (user_id, activity_type, ip_address, details)
-            )
-        except sqlite3.Error as e:
-            logging.error("Failed to log activity: %s", e)
+            with self._transaction() as cursor:
+                for table in tables:
+                    cursor.execute(table)
+        except Exception as e:
+            logging.error(f"Database initialization error: {e}")
+            raise DatabaseError(f"Failed to initialize database: {e}")
+
+    def get_current_user_id(self) -> Optional[int]:
+        """Safely get current user ID"""
+        if self.current_user is None:
+            return None
+        return self.current_user.get('id')
+
+    def get_current_username(self) -> Optional[str]:
+        """Safely get current username"""
+        if self.current_user is None:
+            return None
+        return self.current_user.get('username')
 
     def _generate_salt(self) -> str:
-        """Generate a cryptographically secure random salt."""
+        """Generate a cryptographically secure salt"""
         return secrets.token_hex(self.salt_length)
 
     def _hash_password(self, password: str, salt: str) -> str:
-        """Hash the password using PBKDF2-HMAC."""
+        """Hash password using PBKDF2"""
         return hashlib.pbkdf2_hmac(
             self.hash_algorithm,
             password.encode('utf-8'),
@@ -112,195 +191,303 @@ class UserManager:
             self._hash_iterations
         ).hex()
 
-    def _validate_username(self, username: str) -> Tuple[bool, str]:
-        """Validate the username format and check for disallowed characters."""
-        if not username:
-            return False, "Username cannot be empty"
-        if len(username) > 50:
-            return False, "Username too long (max 50 characters)"
-        if re.search(r'[\'\";\\]', username):
-            return False, "Username contains invalid characters"
-        return True, ""
-
     def _validate_password(self, password: str) -> Tuple[bool, str]:
-        """Validate password strength."""
+        """Validate password strength"""
         if len(password) < self.min_password_length:
-            return False, f"Password must be at least {self.min_password_length} characters long"
+            return False, f"Password must be at least {self.min_password_length} characters"
         if not any(c.isupper() for c in password):
-            return False, "Password must contain at least one uppercase letter"
+            return False, "Password must contain uppercase letters"
         if not any(c.islower() for c in password):
-            return False, "Password must contain at least one lowercase letter"
+            return False, "Password must contain lowercase letters"
         if not any(c.isdigit() for c in password):
-            return False, "Password must contain at least one digit"
+            return False, "Password must contain numbers"
         if not any(c in string.punctuation for c in password):
-            return False, "Password must contain at least one special character"
-        return True, ""
+            return False, "Password must contain special characters"
+        return True, "Password is valid"
+
+    def _log_activity(self, user_id: int, activity_type: str, details: Optional[str] = None) -> None:
+        """Log user activity"""
+        if self.cursor is None:
+            raise DatabaseError("Database cursor not initialized")
+        try:
+            with self._transaction() as cursor:
+                cursor.execute(
+                    'INSERT INTO activity_log (user_id, activity_type, details) VALUES (?, ?, ?)',
+                    (user_id, activity_type, details)
+                )
+        except sqlite3.Error as e:
+            logging.error(f"Activity logging error: {e}")
 
     def register_user(self, username: str, password: str) -> Tuple[bool, str]:
-        """Register a new user with secure password storage."""
-        valid, msg = self._validate_username(username)
-        if not valid:
-            return False, msg
+        """Register a new user"""
+        if self.cursor is None:
+            raise DatabaseError("Database cursor not initialized")
+
+        # Validate password
         valid, msg = self._validate_password(password)
         if not valid:
             return False, msg
 
-        with self._db_transaction():
-            self.cursor.execute('SELECT id FROM users WHERE username = ?', (username,))
-            if self._fetchone():
-                return False, "Username already exists"
-            salt = self._generate_salt()
-            password_hash = self._hash_password(password, salt)
-            self.cursor.execute(
-                '''INSERT INTO users (username, password_hash, salt)
-                   VALUES (?, ?, ?)''',
-                (username, password_hash, salt)
-            )
-            user_id = self.cursor.lastrowid
+        try:
+            with self._transaction() as cursor:
+                # Check if username exists
+                cursor.execute('SELECT 1 FROM users WHERE username = ?', (username,))
+                if cursor.fetchone():
+                    return False, "Username already exists"
 
-        if user_id:
-            self._log_activity(user_id, 'REGISTER')
-        return True, "User registered successfully"
+                # Create new user
+                salt = self._generate_salt()
+                password_hash = self._hash_password(password, salt)
+                cursor.execute(
+                    'INSERT INTO users (username, password_hash, salt) VALUES (?, ?, ?)',
+                    (username, password_hash, salt)
+                )
+                user_id = cursor.lastrowid
+                if user_id is None:
+                    raise DatabaseError("Failed to get new user ID")
+                self._log_activity(user_id, 'REGISTER', f"New user registration: {username}")
+                return True, "Registration successful"
 
-    def login(self, username: str, password: str, ip_address: Optional[str] = None) -> Tuple[bool, str]:
-        """Authenticate a user with the given credentials."""
-        with self._db_transaction():
-            self.cursor.execute(
-                '''SELECT id, password_hash, salt, failed_attempts, locked_until
-                   FROM users WHERE username = ?''',
-                (username,)
-            )
-            user_data = self._fetchone()
+        except Exception as e:
+            logging.error(f"Registration error: {e}")
+            return False, "Registration failed"
 
-        if not user_data:
-            return False, "Invalid username or password"
+    def login(self, username: str, password: str) -> Tuple[bool, str, Optional[int]]:
+        """Authenticate user"""
+        if self.cursor is None:
+            raise DatabaseError("Database cursor not initialized")
 
-        user_id, stored_hash, salt, failed_attempts, locked_until = user_data
+        try:
+            with self._transaction() as cursor:
+                cursor.execute(
+                    '''SELECT id, username, password_hash, salt, failed_attempts,
+                       locked_until, COALESCE(is_admin, 0) as is_admin
+                    FROM users WHERE username = ?''',
+                    (username,)
+                )
+                user = cursor.fetchone()
 
-        if locked_until:
-            if datetime.now() < datetime.strptime(locked_until, '%Y-%m-%d %H:%M:%S'):
-                return False, "Account is temporarily locked due to too many failed attempts"
-            else:
-                self._execute('UPDATE users SET locked_until = NULL, failed_attempts = 0 WHERE id = ?', (user_id,))
+                if not user:
+                    return False, "Invalid username or password", None
 
-        input_hash = self._hash_password(password, salt)
-        if secrets.compare_digest(input_hash, stored_hash):
-            self._execute('UPDATE users SET last_login = CURRENT_TIMESTAMP, failed_attempts = 0 WHERE id = ?', (user_id,))
-            self.session_token = secrets.token_urlsafe(32)
-            self.current_user = {'id': user_id, 'username': username, 'token': self.session_token}
-            self._log_activity(user_id, 'LOGIN_SUCCESS', ip_address)
-            return True, "Login successful"
-        else:
-            self._execute('UPDATE users SET failed_attempts = failed_attempts + 1 WHERE id = ?', (user_id,))
-            if failed_attempts + 1 >= 5:
-                self._execute('UPDATE users SET locked_until = datetime(CURRENT_TIMESTAMP, \'+30 minutes\') WHERE id = ?', (user_id,))
-            self._log_activity(user_id, 'LOGIN_FAILURE', ip_address, "Invalid password")
-            return False, "Invalid username or password"
+                user_dict = dict(user)
+
+                # Check account lock
+                locked_until = user_dict.get('locked_until')
+                if locked_until is not None:
+                    lock_time = datetime.fromisoformat(locked_until)
+                    if datetime.now() < lock_time:
+                        return False, "Account is locked. Please try again later", None
+
+                # Verify password
+                input_hash = self._hash_password(password, user['salt'])
+                if secrets.compare_digest(input_hash, user['password_hash']):
+                    # Check if MFA is enabled
+                    cursor.execute(
+                        'SELECT enabled FROM mfa_settings WHERE user_id = ?',
+                        (user['id'],)
+                    )
+                    mfa_enabled = cursor.fetchone()
+
+                    if mfa_enabled and mfa_enabled['enabled']:
+                        return True, "MFA verification required", user['id']
+
+                    # If MFA not enabled, complete login
+                    self._complete_login(user_dict)
+                    return True, "Login successful", None
+
+                # Failed login handling
+                failed_attempts = user['failed_attempts'] + 1
+                if failed_attempts >= 5:
+                    locked_until = datetime.now() + timedelta(minutes=30)
+                    cursor.execute(
+                        'UPDATE users SET failed_attempts = ?, locked_until = ? WHERE id = ?',
+                        (failed_attempts, locked_until, user['id'])
+                    )
+                    return False, "Too many failed attempts. Account locked for 30 minutes", None
+
+                cursor.execute(
+                    'UPDATE users SET failed_attempts = ? WHERE id = ?',
+                    (failed_attempts, user['id'])
+                )
+                return False, "Invalid username or password", None
+
+        except Exception as e:
+            logging.error(f"Login error: {e}")
+            return False, "Login failed", None
+
+    def _complete_login(self, user: Dict[str, Any]) -> None:
+        """Complete the login process"""
+        self.current_user = {
+            'id': user['id'],
+            'username': user['username'],
+            'is_admin': bool(user['is_admin'])
+        }
+        self._log_activity(user['id'], 'LOGIN', "Successful login")
 
     def logout(self) -> Tuple[bool, str]:
-        """Log out the current user."""
-        if self.current_user:
-            user_id = self.current_user.get('id')
-            if user_id:
-                self._log_activity(user_id, 'LOGOUT')
+        """Log out current user"""
+        if self.current_user is None:
+            return False, "No user is currently logged in"
+
+        try:
+            user_id = self.current_user['id']
+            self._log_activity(user_id, 'LOGOUT', "User logged out")
             self.current_user = None
             self.session_token = None
             return True, "Logged out successfully"
-        return False, "No user is currently logged in"
+        except Exception as e:
+            logging.error(f"Logout error: {e}")
+            return False, "Logout failed"
 
-    def reset_password(self, username: str, new_password: str) -> Tuple[bool, str]:
-        """Reset a user's password."""
-        valid, msg = self._validate_password(new_password)
-        if not valid:
-            return False, msg
+    def generate_password_reset_token(
+        self,
+        username: str
+    ) -> Tuple[bool, str, Optional[str]]:
+        """Generate a password reset token for a user"""
+        if self.cursor is None:
+            raise DatabaseError("Database cursor not initialized")
 
-        with self._db_transaction():
-            self.cursor.execute('SELECT id, salt FROM users WHERE username = ?', (username,))
-            user_data = self._fetchone()
-            if not user_data:
-                return False, "User not found"
-            user_id, salt = user_data
-            new_hash = self._hash_password(new_password, salt)
-            self.cursor.execute(
-                '''UPDATE users
-                   SET password_hash = ?, failed_attempts = 0, locked_until = NULL
-                   WHERE id = ?''',
-                (new_hash, user_id)
-            )
-        self._log_activity(user_id, 'PASSWORD_RESET')
-        return True, "Password reset successfully"
+        try:
+            with self._transaction() as cursor:
+                cursor.execute('SELECT id FROM users WHERE username = ?', (username,))
+                user_data = cursor.fetchone()
 
-    def generate_password_reset_token(self, username: str) -> Tuple[bool, str, Optional[str]]:
-        """Generate a secure password reset token."""
-        with self._db_transaction():
-            self.cursor.execute('SELECT id FROM users WHERE username = ?', (username,))
-            user_data = self._fetchone()
-            if not user_data:
-                return False, "User not found", None
-            user_id = user_data[0]
-            token = secrets.token_urlsafe(32)
-            self.cursor.execute(
-                '''INSERT INTO password_reset_tokens (user_id, token, expires_at)
-                   VALUES (?, ?, datetime(CURRENT_TIMESTAMP, '+1 hour'))''',
-                (user_id, token)
-            )
-        self._log_activity(user_id, 'PASSWORD_RESET_TOKEN_GENERATED')
-        return True, "Token generated successfully", token
+                if not user_data:
+                    return False, "User not found", None
+
+                user_dict = dict(user_data)
+                user_id = user_dict['id']
+                token = secrets.token_urlsafe(32)
+                expires_at = datetime.now() + timedelta(hours=1)
+
+                cursor.execute(
+                    '''INSERT INTO password_reset_tokens
+                    (user_id, token, expires_at) VALUES (?, ?, ?)''',
+                    (user_id, token, expires_at)
+                )
+
+                self._log_activity(user_id, 'RESET_TOKEN_GENERATED')
+                return True, "Reset token generated successfully", token
+
+        except Exception as e:
+            logging.error(f"Error generating reset token: {e}")
+            return False, "Failed to generate reset token", None
 
     def use_password_reset_token(self, token: str, new_password: str) -> Tuple[bool, str]:
-        """Use a password reset token to set a new password."""
+        """Use a password reset token to set a new password"""
+        if self.cursor is None:
+            raise DatabaseError("Database cursor not initialized")
+
+        # Validate new password
         valid, msg = self._validate_password(new_password)
         if not valid:
             return False, msg
 
-        clean_token = token.strip()
-        with self._db_transaction():
-            self.cursor.execute(
-                '''SELECT user_id, expires_at, used
-                   FROM password_reset_tokens
-                   WHERE token = ?''',
-                (clean_token,)
-            )
-            token_data = self._fetchone()
-            if not token_data:
-                self._log_activity(-1, 'TOKEN_VALIDATION_FAILED', details="Token not found in database")
-                return False, "Invalid or expired token"
+        try:
+            with self._transaction() as cursor:
+                cursor.execute(
+                    '''SELECT user_id, expires_at, used
+                    FROM password_reset_tokens
+                    WHERE token = ? AND used = 0''',
+                    (token,)
+                )
+                token_data = cursor.fetchone()
 
-            user_id, expires_at, used = token_data
-            if used:
-                self._log_activity(user_id, 'TOKEN_ALREADY_USED')
-                return False, "This reset link has already been used"
+                if not token_data:
+                    return False, "Invalid or expired token"
 
-            if datetime.utcnow() > datetime.strptime(expires_at, '%Y-%m-%d %H:%M:%S'):
-                self._log_activity(user_id, 'TOKEN_EXPIRED')
-                return False, "This reset link has expired"
+                user_id = token_data['user_id']
+                expires_at = datetime.fromisoformat(token_data['expires_at'])
 
-            self.cursor.execute('SELECT salt FROM users WHERE id = ?', (user_id,))
-            salt_data = self._fetchone()
-            if not salt_data:
-                return False, "User not found"
-            salt = salt_data[0]
-            new_hash = self._hash_password(new_password, salt)
-            
-            # Update user password and mark token as used within the same transaction
-            self.cursor.execute(
-                '''UPDATE users
-                   SET password_hash = ?, failed_attempts = 0, locked_until = NULL
-                   WHERE id = ?''',
-                (new_hash, user_id)
-            )
-            self.cursor.execute(
-                '''UPDATE password_reset_tokens
-                   SET used = 1
-                   WHERE token = ?''',
-                (clean_token,)
-            )
-        self._log_activity(user_id, 'PASSWORD_RESET_VIA_TOKEN')
-        return True, "Password reset successfully"
+                if datetime.now() > expires_at:
+                    return False, "Token has expired"
+
+                # Get user's salt
+                cursor.execute('SELECT salt FROM users WHERE id = ?', (user_id,))
+                salt_data = cursor.fetchone()
+                if not salt_data:
+                    return False, "User not found"
+
+                # Hash new password and update
+                new_password_hash = self._hash_password(new_password, salt_data['salt'])
+                cursor.execute(
+                    'UPDATE users SET password_hash = ? WHERE id = ?',
+                    (new_password_hash, user_id)
+                )
+                cursor.execute(
+                    'UPDATE password_reset_tokens SET used = 1 WHERE token = ?',
+                    (token,)
+                )
+
+                self._log_activity(user_id, 'PASSWORD_RESET_COMPLETE')
+                return True, "Password reset successful"
+
+        except Exception as e:
+            logging.error(f"Error using reset token: {e}")
+            return False, "Failed to reset password"
+
+    def reset_password(self, username: str, new_password: str) -> Tuple[bool, str]:
+        """Reset user's password"""
+        if self.cursor is None:
+            raise DatabaseError("Database cursor not initialized")
+
+        valid, msg = self._validate_password(new_password)
+        if not valid:
+            return False, msg
+
+        try:
+            with self._transaction() as cursor:
+                cursor.execute('SELECT id, salt FROM users WHERE username = ?', (username,))
+                user_data = cursor.fetchone()
+
+                if not user_data:
+                    return False, "User not found"
+
+                new_password_hash = self._hash_password(new_password, user_data['salt'])
+                cursor.execute(
+                    '''UPDATE users
+                    SET password_hash = ?,
+                        failed_attempts = 0,
+                        locked_until = NULL
+                    WHERE id = ?''',
+                    (new_password_hash, user_data['id'])
+                )
+
+                self._log_activity(user_data['id'], 'PASSWORD_RESET')
+                return True, "Password reset successful"
+
+        except Exception as e:
+            logging.error(f"Password reset error: {e}")
+            return False, "Failed to reset password"
+
+    def is_admin(self, user_id: int) -> bool:
+        """Check if user has admin privileges"""
+        if self.cursor is None:
+            return False
+
+        try:
+            with self._transaction() as cursor:
+                cursor.execute('SELECT is_admin FROM users WHERE id = ?', (user_id,))
+                result = cursor.fetchone()
+                return bool(result and result['is_admin'])
+        except Exception as e:
+            logging.error(f"Admin check error: {e}")
+            return False
 
     def close(self) -> None:
-        """Close the database connection."""
-        if self.conn:
-            self.conn.close()
-            self.conn = None
-            self.cursor = None
+        """Close database connection"""
+        if self.connection is not None:
+            try:
+                self.connection.close()
+            except Exception as e:
+                logging.error(f"Error closing database connection: {e}")
+            finally:
+                self.connection = None
+                self.cursor = None
+
+    def __enter__(self) -> 'UserManager':
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
