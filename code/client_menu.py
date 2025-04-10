@@ -89,7 +89,7 @@ class ClientMenu:
             print("11. Exit")
 
             try:
-                choice = input("Enter your choice (1-8): ").strip()
+                choice = input("Enter your choice (1-11): ").strip()
 
                 menu_actions = {
                     "1": self._handle_upload,
