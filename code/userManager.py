@@ -191,6 +191,21 @@ class UserManager:
             self._hash_iterations
         ).hex()
 
+    def _validate_username(self, username: str) -> Tuple[bool, str]:
+        """Validate username for security"""
+        if not username:
+            return False, "Username cannot be empty"
+
+        # Check length
+        if len(username) < 3 or len(username) > 30:
+            return False, "Username must be between 3 and 30 characters"
+
+        # Only allow alphanumeric characters and underscores
+        if not re.match("^[a-zA-Z0-9_]+$", username):
+            return False, "Username can only contain letters, numbers, and underscores"
+
+        return True, "Username is valid"
+
     def _validate_password(self, password: str) -> Tuple[bool, str]:
         """Validate password strength"""
         if len(password) < self.min_password_length:
@@ -219,6 +234,9 @@ class UserManager:
             logging.error(f"Activity logging error: {e}")
 
     def register_user(self, username: str, password: str) -> Tuple[bool, str]:
+        valid_username, username_msg = self._validate_username(username)
+        if not valid_username:
+            return False, username_msg
         """Register a new user"""
         if self.cursor is None:
             raise DatabaseError("Database cursor not initialized")
