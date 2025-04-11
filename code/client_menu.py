@@ -206,6 +206,9 @@ class ClientMenu:
         try:
             print("\n=== Upload File ===")
             file_path = input("Enter file path: ").strip()
+            if file_path.startswith('"') and file_path.endswith('"'):
+                file_path = file_path[1:-1]
+            
             if not os.path.exists(file_path):
                 print("File does not exist!")
                 return
@@ -223,6 +226,7 @@ class ClientMenu:
         if not current_user:
             print("No user is currently logged in!")
             return
+
         print("\n=== Download File ===")
         self._handle_list_files()
         file_id_input = input("Enter file ID to download (or 0 to cancel): ").strip()
@@ -232,13 +236,36 @@ class ClientMenu:
         file_id = int(file_id_input)
         if file_id == 0:
             return
+
         current_user_id = self.user_manager.get_current_user_id()
         if current_user_id is None:
             print("Error: No user ID available")
             return
-        success, message, data = self.file_manager.download_file(file_id, current_user_id)
+
+        success, message, data, original_filename = self.file_manager.download_file(file_id, current_user_id)
         if success and data:
-            output_path = input("Enter path to save file (include filename): ").strip()
+            # Ask for the directory where to save the file.
+            directory = input("Enter directory to save the file (press Enter for current directory): ").strip()
+            if not directory:
+                # Use current directory as default
+                directory = os.getcwd() 
+
+            # Ensure the directory exists.
+            if not os.path.exists(directory):
+                try:
+                    os.makedirs(directory, exist_ok=True)
+                except Exception as e:
+                    print("Error creating directory:", e)
+                    return
+
+            # Use the original filename as the default value.
+            default_filename = original_filename if original_filename else "downloaded_file"
+            filename = input(f"Enter the filename to save as (press Enter to use '{default_filename}'): ").strip()
+            if not filename:
+                filename = default_filename
+
+            # Ensure the output path combines the directory and filename.
+            output_path = os.path.join(directory, filename)
             try:
                 with open(output_path, 'wb') as f:
                     f.write(data)
@@ -506,19 +533,17 @@ class ClientMenu:
             print("2. List All Users")
             print("3. View System Statistics")
             print("4. Manage Files")
-            print("5. Regular User Menu")
-            print("6. Logout")
-            print("7. Exit")
+            print("5. Logout")
+            print("6. Exit")
             try:
-                choice = input("Enter your choice (1-7): ").strip()
+                choice = input("Enter your choice (1-6): ").strip()
                 menu_actions = {
                     "1": self._handle_view_logs,
                     "2": self._handle_list_users,
                     "3": self._handle_system_stats,
                     "4": self._handle_manage_files,
-                    "5": self._show_main_menu,
-                    "6": self._handle_logout,
-                    "7": self._handle_exit
+                    "5": self._handle_logout,
+                    "6": self._handle_exit
                 }
                 action = menu_actions.get(choice)
                 if action and callable(action):
