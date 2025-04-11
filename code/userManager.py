@@ -9,6 +9,10 @@ from sqlite3.dbapi2 import Connection, Cursor
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 
+from .config import Config
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 class DatabaseCursor(Protocol):
     def execute(self, query: str, params: Union[Tuple[Any, ...], Dict[str, Any]] = ...) -> Any: ...
     def fetchone(self) -> Optional[sqlite3.Row]: ...
@@ -32,23 +36,17 @@ class UserData(TypedDict):
     failed_attempts: int
     locked_until: Optional[str]
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-
 class DatabaseError(Exception):
-    """Custom exception for database errors"""
     pass
 
 class UserManager:
-    def __init__(self, db_name: str = 'secure_storage.db'):
+    def __init__(self, db_name: str = Config.DATABASE_NAME) -> None:
         self.db_name: str = db_name
-        self.min_password_length: int = 8
+        self.min_password_length: int = Config.MIN_PASSWORD_LENGTH
         self.salt_length: int = 32
         self._hash_iterations: int = 100000
         self.hash_algorithm: str = 'sha256'
-        self.current_user: Optional[Dict[str, Any]] = None  # Changed from UserData
+        self.current_user: Optional[Dict[str, Any]] = None
         self.session_token: Optional[str] = None
         self.connection: Optional[sqlite3.Connection] = None
         self.cursor: Optional[sqlite3.Cursor] = None
@@ -56,42 +54,32 @@ class UserManager:
         self._initialize_db()
 
     def _connect_db(self) -> None:
-        """Establish database connection"""
         try:
-            conn = sqlite3.connect(self.db_name)
-            if conn is None:
-                raise DatabaseError("Failed to create database connection")
-            conn.row_factory = sqlite3.Row
-            self.connection = conn
-            self.cursor = conn.cursor()
-            if self.cursor is None:
-                raise DatabaseError("Failed to create database cursor")
+            self.connection = sqlite3.connect(
+                self.db_name,
+                detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES
+            )
+            self.connection.row_factory = sqlite3.Row
+            self.cursor = self.connection.cursor()
         except sqlite3.Error as e:
             logging.error(f"Database connection error: {e}")
             raise DatabaseError(f"Failed to connect to database: {e}")
 
+    # Context manager for database transactions
     @contextmanager
     def _transaction(self) -> Generator[sqlite3.Cursor, None, None]:
-        """Context manager for database transactions"""
-        if self.connection is None or self.cursor is None:
+        if not self.connection or not self.cursor:
             self._connect_db()
-        if self.connection is None or self.cursor is None:
-            raise DatabaseError("Database connection not established")
         try:
             yield self.cursor
-            if self.connection is not None:
-                self.connection.commit()
-        except Exception as e:
-            if self.connection is not None:
-                self.connection.rollback()
+            self.connection.commit()
+        except sqlite3.Error as e:
+            self.connection.rollback()
             logging.error(f"Transaction error: {e}")
-            raise
+            raise DatabaseError(f"Transaction failed: {e}")
 
+    # Initialize database tables
     def _initialize_db(self) -> None:
-        """Initialize database tables"""
-        if self.cursor is None:
-            raise DatabaseError("Database cursor not initialized")
-
         tables = [
             '''CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -167,47 +155,22 @@ class UserManager:
             raise DatabaseError(f"Failed to initialize database: {e}")
 
     def get_current_user_id(self) -> Optional[int]:
-        """Safely get current user ID"""
-        if self.current_user is None:
-            return None
-        return self.current_user.get('id')
+        return self.current_user.get('id') if self.current_user else None
 
     def get_current_username(self) -> Optional[str]:
-        """Safely get current username"""
-        if self.current_user is None:
-            return None
-        return self.current_user.get('username')
-
-    def _generate_salt(self) -> str:
-        """Generate a cryptographically secure salt"""
-        return secrets.token_hex(self.salt_length)
-
-    def _hash_password(self, password: str, salt: str) -> str:
-        """Hash password using PBKDF2"""
-        return hashlib.pbkdf2_hmac(
-            self.hash_algorithm,
-            password.encode('utf-8'),
-            salt.encode('utf-8'),
-            self._hash_iterations
-        ).hex()
+        return self.current_user.get('username') if self.current_user else None
 
     def _validate_username(self, username: str) -> Tuple[bool, str]:
-        """Validate username for security"""
         if not username:
             return False, "Username cannot be empty"
-
-        # Check length
         if len(username) < 3 or len(username) > 30:
             return False, "Username must be between 3 and 30 characters"
-
-        # Only allow alphanumeric characters and underscores
         if not re.match("^[a-zA-Z0-9_]+$", username):
             return False, "Username can only contain letters, numbers, and underscores"
 
         return True, "Username is valid"
 
     def _validate_password(self, password: str) -> Tuple[bool, str]:
-        """Validate password strength"""
         if len(password) < self.min_password_length:
             return False, f"Password must be at least {self.min_password_length} characters"
         if not any(c.isupper() for c in password):
@@ -220,10 +183,20 @@ class UserManager:
             return False, "Password must contain special characters"
         return True, "Password is valid"
 
+    # Generate a cryptographically secure salt
+    def _generate_salt(self) -> str:
+        return secrets.token_hex(self.salt_length)
+
+    # Hash password using PBKDF2
+    def _hash_password(self, password: str, salt: str) -> str:
+        return hashlib.pbkdf2_hmac(
+            self.hash_algorithm,
+            password.encode('utf-8'),
+            salt.encode('utf-8'),
+            self._hash_iterations
+        ).hex()
+
     def _log_activity(self, user_id: int, activity_type: str, details: Optional[str] = None) -> None:
-        """Log user activity"""
-        if self.cursor is None:
-            raise DatabaseError("Database cursor not initialized")
         try:
             with self._transaction() as cursor:
                 cursor.execute(
@@ -234,10 +207,10 @@ class UserManager:
             logging.error(f"Activity logging error: {e}")
 
     def register_user(self, username: str, password: str) -> Tuple[bool, str]:
+        # Validate 
         valid_username, username_msg = self._validate_username(username)
         if not valid_username:
             return False, username_msg
-        """Register a new user"""
         if self.cursor is None:
             raise DatabaseError("Database cursor not initialized")
 
@@ -393,10 +366,6 @@ class UserManager:
             return False, "Failed to generate reset token", None
 
     def use_password_reset_token(self, token: str, new_password: str) -> Tuple[bool, str]:
-        """Use a password reset token to set a new password"""
-        if self.cursor is None:
-            raise DatabaseError("Database cursor not initialized")
-
         # Validate new password
         valid, msg = self._validate_password(new_password)
         if not valid:
@@ -411,23 +380,23 @@ class UserManager:
                     (token,)
                 )
                 token_data = cursor.fetchone()
-
                 if not token_data:
                     return False, "Invalid or expired token"
 
                 user_id = token_data['user_id']
-                expires_at = datetime.fromisoformat(token_data['expires_at'])
+                expires_at = token_data['expires_at']
+                # Check if expires_at is already a datetime object
+                if not isinstance(expires_at, datetime):
+                    expires_at = datetime.fromisoformat(expires_at)
 
                 if datetime.now() > expires_at:
                     return False, "Token has expired"
 
-                # Get user's salt
                 cursor.execute('SELECT salt FROM users WHERE id = ?', (user_id,))
                 salt_data = cursor.fetchone()
                 if not salt_data:
                     return False, "User not found"
 
-                # Hash new password and update
                 new_password_hash = self._hash_password(new_password, salt_data['salt'])
                 cursor.execute(
                     'UPDATE users SET password_hash = ? WHERE id = ?',
@@ -442,8 +411,9 @@ class UserManager:
                 return True, "Password reset successful"
 
         except Exception as e:
-            logging.error(f"Error using reset token: {e}")
+            logging.error(f"Error using reset token: {e}", exc_info=True)
             return False, "Failed to reset password"
+
 
     def reset_password(self, username: str, new_password: str) -> Tuple[bool, str]:
         """Reset user's password"""

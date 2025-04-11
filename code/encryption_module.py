@@ -7,101 +7,105 @@ from cryptography.hazmat.backends import default_backend
 from base64 import b64encode, b64decode
 from typing import Tuple, Optional
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Import encryption configuration from config
+from .config import Config
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 class EncryptionError(Exception):
-    """Custom exception for encryption operations"""
+    """Custom exception for encryption operations."""
     pass
 
 class Encryptor:
     def __init__(self):
-        self.KEY_LENGTH = 32  # 256 bits
-        self.NONCE_LENGTH = 12  # 96 bits
-        self.SALT_LENGTH = 16  # 128 bits
+        # Use configuration values so that they can be tuned externally.
+        self.KEY_LENGTH = Config.KEY_LENGTH   # in bytes
+        self.NONCE_LENGTH = Config.NONCE_LENGTH
+        self.SALT_LENGTH = Config.SALT_LENGTH
+        self.ITERATIONS = Config.ITERATIONS
 
     def generate_key(self) -> bytes:
-        """Generate a new encryption key"""
+        """Generate a new encryption key."""
         try:
-            return AESGCM.generate_key(bit_length=256)
+            return AESGCM.generate_key(bit_length=self.KEY_LENGTH * 8)
         except Exception as e:
-            logging.error(f"Key generation error: {e}")
+            logger.error(f"Key generation error: {e}", exc_info=True)
             raise EncryptionError("Failed to generate encryption key")
 
     def derive_key(self, password: str, salt: Optional[bytes] = None) -> Tuple[bytes, bytes]:
-        """Derive encryption key from password"""
+        """Derive an encryption key from the given password."""
         try:
             if salt is None:
                 salt = os.urandom(self.SALT_LENGTH)
-
             kdf = PBKDF2HMAC(
                 algorithm=hashes.SHA256(),
                 length=self.KEY_LENGTH,
                 salt=salt,
-                iterations=100000,
+                iterations=self.ITERATIONS,
                 backend=default_backend()
             )
-            key = kdf.derive(password.encode())
+            key = kdf.derive(password.encode('utf-8'))
             return key, salt
         except Exception as e:
-            logging.error(f"Key derivation error: {e}")
+            logger.error(f"Key derivation error: {e}", exc_info=True)
             raise EncryptionError("Failed to derive key")
 
-    def encrypt_file(self, file_path: str, key: bytes) -> Tuple[str, bytes]:
-        """Encrypt a file and return the encrypted data and nonce"""
+    def _encrypt_bytes(self, data: bytes, key: bytes) -> Tuple[str, bytes]:
+        """
+        Encrypt the provided bytes using AES-GCM.
+        Returns a tuple of (encoded encrypted data, nonce).
+        """
         try:
-            with open(file_path, 'rb') as f:
-                data = f.read()
-
             aesgcm = AESGCM(key)
             nonce = os.urandom(self.NONCE_LENGTH)
             encrypted_data = aesgcm.encrypt(nonce, data, None)
-
-            # Combine nonce and encrypted data
+            # Prepend nonce to the ciphertext for storage.
             complete_data = nonce + encrypted_data
-
-            # Encode for storage
             encoded_data = b64encode(complete_data).decode('utf-8')
             return encoded_data, nonce
-
         except Exception as e:
-            logging.error(f"File encryption error: {e}")
+            logger.error(f"Encryption error: {e}", exc_info=True)
+            raise EncryptionError(f"Failed to encrypt data: {e}")
+
+    def encrypt_file(self, file_path: str, key: bytes) -> Tuple[str, bytes]:
+        """
+        Encrypt an entire file.
+        Reads the file content and delegates encryption to _encrypt_bytes.
+        Returns a tuple of (encoded encrypted data, nonce).
+        """
+        try:
+            with open(file_path, 'rb') as f:
+                data = f.read()
+            return self._encrypt_bytes(data, key)
+        except Exception as e:
+            logger.error(f"File encryption error: {e}", exc_info=True)
             raise EncryptionError(f"Failed to encrypt file: {e}")
 
-    def decrypt_file(self, encrypted_data: str, key: bytes) -> bytes:
-        """Decrypt encrypted data using the provided key"""
+    def encrypt_file_content(self, content: bytes, key: bytes) -> Tuple[str, bytes]:
+        """
+        Encrypt file content provided as bytes.
+        Delegates encryption to _encrypt_bytes.
+        Returns a tuple of (encoded encrypted data, nonce).
+        """
         try:
-            # Decode from storage format
-            complete_data = b64decode(encrypted_data.encode('utf-8'))
+            return self._encrypt_bytes(content, key)
+        except Exception as e:
+            logger.error(f"Content encryption error: {e}", exc_info=True)
+            raise EncryptionError(f"Failed to encrypt content: {e}")
 
-            # Split nonce and ciphertext
+    def decrypt_file(self, encrypted_data: str, key: bytes) -> bytes:
+        """
+        Decrypt encrypted data using the provided key.
+        Assumes the encrypted data was encoded with b64encode() after concatenating nonce and ciphertext.
+        """
+        try:
+            complete_data = b64decode(encrypted_data.encode('utf-8'))
             nonce = complete_data[:self.NONCE_LENGTH]
             ciphertext = complete_data[self.NONCE_LENGTH:]
-
             aesgcm = AESGCM(key)
             decrypted_data = aesgcm.decrypt(nonce, ciphertext, None)
             return decrypted_data
-
         except Exception as e:
-            logging.error(f"File decryption error: {e}")
+            logger.error(f"File decryption error: {e}", exc_info=True)
             raise EncryptionError(f"Failed to decrypt file: {e}")
-
-    def encrypt_file_content(self, content: bytes, key: bytes) -> Tuple[str, bytes]:
-            """Encrypt file content and return the encrypted data and nonce"""
-            try:
-                aesgcm = AESGCM(key)
-                nonce = os.urandom(self.NONCE_LENGTH)
-                encrypted_data = aesgcm.encrypt(nonce, content, None)
-
-                # Combine nonce and encrypted data
-                complete_data = nonce + encrypted_data
-
-                # Encode for storage
-                encoded_data = b64encode(complete_data).decode('utf-8')
-                return encoded_data, nonce
-
-            except Exception as e:
-                logging.error(f"Content encryption error: {e}")
-                raise EncryptionError(f"Failed to encrypt content: {e}")
