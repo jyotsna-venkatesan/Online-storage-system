@@ -6,7 +6,7 @@ class Config:
     MIN_PASSWORD_LENGTH = 8
     MAX_LOGIN_ATTEMPTS = 5
     LOCKOUT_DURATION = 30  # minutes
-    TOKEN_EXPIRY = 60  # minutes
+    TOKEN_EXPIRY = 60      # minutes
     MFA_ENABLED = True
 
     KEY_LENGTH = 32       # 256 bits
@@ -21,3 +21,7 @@ class Config:
 def setup_logging() -> None:
     """Setup logging configuration once at application startup."""
     logging.basicConfig(level=Config.LOGGING_LEVEL, format=Config.LOGGING_FORMAT)
+
+class DatabaseError(Exception):
+    """Custom exception for database-related errors."""
+    pass

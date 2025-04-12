@@ -3,9 +3,11 @@ import getpass
 import logging
 import sqlite3
 from typing import Optional, TypedDict
-from .userManager import UserManager
-from .file_manager import FileManager
-from .mfa import MFAManager
+
+from ..db.db_manager import DbManager
+from ..services.userManager import UserManager
+from ..services.file_manager import FileManager
+from ..services.mfa import MFAManager
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -18,9 +20,10 @@ class UserDict(TypedDict):
 class ClientMenu:
     def __init__(self):
         # Create and use shared instances.
-        self.user_manager = UserManager()
+        self.db_manager   = DbManager()
+        self.user_manager = UserManager(self.db_manager)
         self.file_manager = FileManager(self.user_manager)
-        self.mfa_manager = MFAManager()
+        self.mfa_manager = MFAManager(self.db_manager, test_mode=True)
         self.current_user: Optional[UserDict] = None
 
     def display_menu(self):
@@ -133,11 +136,13 @@ class ClientMenu:
                 if not mfa_success:
                     print(f"Failed to send OTP: {mfa_message}")
                     return
+
                 otp = input("Enter the OTP sent to your email: ").strip()
                 if self.mfa_manager.verify_otp(user_id, otp):
-                    with self.user_manager._transaction() as cursor:
+                    # Complete login by loading user into session
+                    with self.db_manager.transaction() as cursor:
                         cursor.execute(
-                            '''SELECT id, username, is_admin FROM users WHERE id = ?''',
+                            'SELECT id, username, is_admin FROM users WHERE id = ?',
                             (user_id,)
                         )
                         user = cursor.fetchone()
@@ -149,16 +154,18 @@ class ClientMenu:
                 else:
                     print("Invalid OTP")
             else:
+                # Either plain login success (no MFA) or failure
                 print(message)
 
+            # If they logged in without MFA, offer to enable it
             if success and user_id is None:
                 print("\nWould you like to enable Two-Factor Authentication?")
                 if input("Enable MFA (y/n): ").strip().lower() == 'y':
                     email = input("Enter your email address: ").strip()
                     current_user_id = self.user_manager.get_current_user_id()
                     if current_user_id is not None:
-                        success, message = self.mfa_manager.setup_mfa_for_user(current_user_id, email)
-                        print(message)
+                        setup_success, setup_msg = self.mfa_manager.setup_mfa_for_user(current_user_id, email)
+                        print(setup_msg)
                     else:
                         print("Error: No user ID available")
         except Exception as e:
@@ -394,7 +401,7 @@ class ClientMenu:
         if file_id == 0:
             return
         try:
-            success, message, data = self.file_manager.download_file(
+            success, message, data, _ = self.file_manager.download_file(
                 file_id,
                 current_user['id']
             )
@@ -424,7 +431,7 @@ class ClientMenu:
         if file_id == 0:
             return
         try:
-            success, message, data = self.file_manager.download_file(
+            success, message, data, _ = self.file_manager.download_file(
                 file_id,
                 current_user['id']
             )
@@ -533,17 +540,19 @@ class ClientMenu:
             print("2. List All Users")
             print("3. View System Statistics")
             print("4. Manage Files")
-            print("5. Logout")
-            print("6. Exit")
+            print("5. Unlock User Account")
+            print("6. Logout")
+            print("7. Exit")
             try:
-                choice = input("Enter your choice (1-6): ").strip()
+                choice = input("Enter your choice (1-7): ").strip()
                 menu_actions = {
                     "1": self._handle_view_logs,
                     "2": self._handle_list_users,
                     "3": self._handle_system_stats,
                     "4": self._handle_manage_files,
-                    "5": self._handle_logout,
-                    "6": self._handle_exit
+                    "5": self._handle_unlock_account,
+                    "6": self._handle_logout,
+                    "7": self._handle_exit
                 }
                 action = menu_actions.get(choice)
                 if action and callable(action):
@@ -562,22 +571,29 @@ class ClientMenu:
     def _handle_view_logs(self):
         print("\n=== Activity Logs ===")
         try:
-            with self.user_manager._transaction() as cursor:
-                cursor.execute('''
-                    SELECT al.timestamp, u.username, al.activity_type, al.details
-                    FROM activity_log al
-                    LEFT JOIN users u ON al.user_id = u.id
-                    ORDER BY al.timestamp DESC
-                    LIMIT 50
-                ''')
+            with self.user_manager.db.transaction() as cursor:
+                cursor.execute(
+                    '''SELECT al.timestamp, u.username, al.activity_type, al.details
+                       FROM activity_log al
+                       LEFT JOIN users u ON al.user_id = u.id
+                       ORDER BY al.timestamp DESC
+                       LIMIT 50'''
+                )
                 logs = cursor.fetchall()
-                if not logs:
-                    print("No activity logs found.")
-                    return
-                print("Timestamp | Username | Activity | Details")
-                print("-" * 80)
-                for log in logs:
-                    print(f"{log['timestamp']} | {log['username'] or 'System'} | {log['activity_type']} | {log['details']}")
+
+            if not logs:
+                print("No activity logs found.")
+                return
+
+            print("Timestamp | Username | Activity | Details")
+            print("-" * 80)
+            for log in logs:
+                ts       = log['timestamp']
+                user     = log['username'] or 'System'
+                activity = log['activity_type']
+                details  = log['details']
+                print(f"{ts} | {user} | {activity} | {details}")
+
         except Exception as e:
             logger.error(f"Error viewing logs: {e}", exc_info=True)
             print("Failed to retrieve activity logs")
@@ -585,22 +601,26 @@ class ClientMenu:
     def _handle_list_users(self):
         print("\n=== User List ===")
         try:
-            with self.user_manager._transaction() as cursor:
-                cursor.execute('''
-                    SELECT username, created_at, last_login,
-                           failed_attempts, locked_until
-                    FROM users
-                    ORDER BY created_at DESC
-                ''')
+            with self.user_manager.db.transaction() as cursor:
+                cursor.execute(
+                    '''SELECT username, created_at, last_login,
+                              failed_attempts, locked_until
+                       FROM users
+                       ORDER BY created_at DESC'''
+                )
                 users = cursor.fetchall()
-                if not users:
-                    print("No users found.")
-                    return
-                print("Username | Created | Last Login | Status")
-                print("-" * 80)
-                for user in users:
-                    status = "Locked" if user['locked_until'] else "Active"
-                    print(f"{user['username']} | {user['created_at']} | {user['last_login'] or 'Never'} | {status}")
+
+            if not users:
+                print("No users found.")
+                return
+
+            print("Username | Created | Last Login | Status")
+            print("-" * 80)
+            for u in users:
+                status = "Locked" if u['locked_until'] else "Active"
+                last_login = u['last_login'] or 'Never'
+                print(f"{u['username']} | {u['created_at']} | {last_login} | {status}")
+
         except Exception as e:
             logger.error(f"Error listing users: {e}", exc_info=True)
             print("Failed to retrieve user list")
@@ -608,16 +628,20 @@ class ClientMenu:
     def _handle_system_stats(self):
         print("\n=== System Statistics ===")
         try:
-            with self.user_manager._transaction() as cursor:
-                cursor.execute('SELECT COUNT(*) as count FROM users')
+            with self.user_manager.db.transaction() as cursor:
+                cursor.execute('SELECT COUNT(*) AS count FROM users')
                 user_count = cursor.fetchone()['count']
-                cursor.execute('SELECT COUNT(*) as count FROM files')
+
+                cursor.execute('SELECT COUNT(*) AS count FROM files')
                 file_count = cursor.fetchone()['count']
-                cursor.execute('SELECT COUNT(*) as count FROM file_shares')
+
+                cursor.execute('SELECT COUNT(*) AS count FROM file_shares')
                 share_count = cursor.fetchone()['count']
-                print(f"Total Users: {user_count}")
-                print(f"Total Files: {file_count}")
-                print(f"Total Shares: {share_count}")
+
+            print(f"Total Users: {user_count}")
+            print(f"Total Files: {file_count}")
+            print(f"Total Shares: {share_count}")
+
         except Exception as e:
             logger.error(f"Error getting statistics: {e}", exc_info=True)
             print("Failed to retrieve system statistics")
@@ -625,24 +649,28 @@ class ClientMenu:
     def _handle_manage_files(self):
         print("\n=== File Management ===")
         try:
-            with self.user_manager._transaction() as cursor:
-                cursor.execute('''
-                    SELECT f.id, f.filename, u.username as owner, f.created_at
-                    FROM files f
-                    JOIN users u ON f.owner_id = u.id
-                    ORDER BY f.created_at DESC
-                ''')
+            with self.user_manager.db.transaction() as cursor:
+                cursor.execute(
+                    '''SELECT f.id, f.filename, u.username AS owner, f.created_at
+                       FROM files f
+                       JOIN users u ON f.owner_id = u.id
+                       ORDER BY f.created_at DESC'''
+                )
                 files = cursor.fetchall()
-                if not files:
-                    print("No files found in the system.")
-                    return
-                print("ID | Filename | Owner | Created At")
-                print("-" * 80)
-                for file in files:
-                    print(f"{file['id']} | {file['filename']} | {file['owner']} | {file['created_at']}")
+
+            if not files:
+                print("No files found in the system.")
+                return
+
+            print("ID | Filename | Owner | Created At")
+            print("-" * 80)
+            for f in files:
+                print(f"{f['id']} | {f['filename']} | {f['owner']} | {f['created_at']}")
+
         except Exception as e:
             logger.error(f"Error managing files: {e}", exc_info=True)
             print("Failed to retrieve file list")
+
 
     def _handle_change_password(self):
         current_user = self.user_manager.current_user
@@ -672,6 +700,15 @@ class ClientMenu:
         except Exception as e:
             logger.error(f"Password change error: {e}", exc_info=True)
             print("Failed to change password")
+
+    def _handle_unlock_account(self):
+        print("\n=== Unlock User Account ===")
+        username = input("Enter the username to unlock: ").strip()
+        if not username:
+            print("Username cannot be empty")
+            return
+        success, message = self.user_manager.unlock_account(username)
+        print(message)
 
     def _handle_logout(self):
         success, message = self.user_manager.logout()

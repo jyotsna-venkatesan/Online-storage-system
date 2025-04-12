@@ -1,10 +1,14 @@
+# file_manager.py
+
 import os
 import logging
 from typing import Tuple, List, Dict, Optional, Any
 from base64 import b64encode, b64decode
-from .config import Config
-from .encryption_module import Encryptor
-from .userManager import UserManager, DatabaseError
+
+from ..config import Config
+from ..encryption_module import Encryptor
+from .userManager import UserManager
+from ..db.db_manager import DbManager
 
 logger = logging.getLogger(__name__)
 
@@ -12,10 +16,15 @@ class FileOperationError(Exception):
     pass
 
 class FileManager:
-    def __init__(self, user_manager: UserManager, storage_dir: str = Config.STORAGE_DIR) -> None:
+    def __init__(
+        self,
+        user_manager: UserManager,
+        storage_dir: str = Config.STORAGE_DIR
+    ) -> None:
         self.storage_dir = storage_dir
         self.encryptor = Encryptor()
         self.user_manager = user_manager
+        self.db: DbManager = user_manager.db
         self._ensure_storage_dir()
 
     def _ensure_storage_dir(self) -> None:
@@ -25,7 +34,6 @@ class FileManager:
             logger.error("Error creating storage directory: %s", e, exc_info=True)
             raise FileOperationError(f"Failed to create storage directory: {e}")
 
-    # Validate filename for security
     def _validate_filename(self, filename: str) -> Tuple[bool, str]:
         if not filename:
             return False, "Filename cannot be empty"
@@ -35,7 +43,6 @@ class FileManager:
             return False, "File type not allowed"
         return True, "Filename is valid"
 
-    # Upload and encrypt a file
     def upload_file(self, file_path: str, user_id: int) -> Tuple[bool, str]:
         if not os.path.exists(file_path):
             return False, "File does not exist"
@@ -52,7 +59,7 @@ class FileManager:
             return False, "Failed to encrypt file"
 
         try:
-            with self.user_manager._transaction() as cursor:
+            with self.db.transaction() as cursor:
                 cursor.execute(
                     '''INSERT INTO files (owner_id, filename, file_path, encryption_key)
                        VALUES (?, ?, ?, ?)''',
@@ -64,56 +71,59 @@ class FileManager:
             logger.error("File upload error: %s", e, exc_info=True)
             return False, f"Failed to upload file: {e}"
 
-    # Download and decrypt a file
-    def download_file(self, file_id: int, user_id: int) -> Tuple[bool, str, Optional[bytes], Optional[str]]:
+    def download_file(
+        self,
+        file_id: int,
+        user_id: int
+    ) -> Tuple[bool, str, Optional[bytes], Optional[str]]:
         try:
-            with self.user_manager._transaction() as cursor:
+            with self.db.transaction() as cursor:
                 cursor.execute(
                     '''SELECT f.*, fs.id as share_id
-                    FROM files f
-                    LEFT JOIN file_shares fs ON f.id = fs.file_id AND fs.shared_with_id = ?
-                    WHERE f.id = ? AND (f.owner_id = ? OR fs.id IS NOT NULL)''',
+                       FROM files f
+                       LEFT JOIN file_shares fs
+                         ON f.id = fs.file_id AND fs.shared_with_id = ?
+                       WHERE f.id = ? AND (f.owner_id = ? OR fs.id IS NOT NULL)''',
                     (user_id, file_id, user_id)
                 )
                 file_data = cursor.fetchone()
+
             if not file_data:
                 return False, "File not found or access denied", None, None
 
-            # Retrieve and decode the encryption key.
             key = b64decode(file_data['encryption_key'])
-            # Decrypt the file content stored in the 'file_path' column.
             decrypted_data = self.encryptor.decrypt_file(file_data['file_path'], key)
             self.user_manager._log_activity(user_id, 'DOWNLOAD', f"File downloaded: {file_data['filename']}")
-            # Return an extra element for the original filename.
             return True, "File downloaded successfully", decrypted_data, file_data['filename']
+
         except Exception as e:
             logger.error("File download error: %s", e, exc_info=True)
             return False, f"Failed to download file: {e}", None, None
 
-    # Share a file with another user
     def share_file(self, file_id: int, owner_id: int, shared_with_id: int) -> Tuple[bool, str]:
         try:
-            with self.user_manager._transaction() as cursor:
+            with self.db.transaction() as cursor:
                 cursor.execute(
                     'SELECT 1 FROM files WHERE id = ? AND owner_id = ?',
                     (file_id, owner_id)
                 )
                 if not cursor.fetchone():
                     return False, "File not found or you don't have permission"
+
                 cursor.execute(
                     'INSERT INTO file_shares (file_id, shared_with_id) VALUES (?, ?)',
                     (file_id, shared_with_id)
                 )
+
             self.user_manager._log_activity(owner_id, 'SHARE', f"File {file_id} shared with user {shared_with_id}")
             return True, "File shared successfully"
         except Exception as e:
             logger.error("File sharing error: %s", e, exc_info=True)
             return False, f"Failed to share file: {e}"
 
-    # List files owned by a user
     def list_user_files(self, user_id: int) -> List[Dict[str, Any]]:
         try:
-            with self.user_manager._transaction() as cursor:
+            with self.db.transaction() as cursor:
                 cursor.execute(
                     '''SELECT id, filename, created_at
                        FROM files
@@ -127,10 +137,9 @@ class FileManager:
             logger.error("Error listing files: %s", e, exc_info=True)
             return []
 
-    # List files shared with a user
     def list_shared_files(self, user_id: int) -> List[Dict[str, Any]]:
         try:
-            with self.user_manager._transaction() as cursor:
+            with self.db.transaction() as cursor:
                 cursor.execute(
                     '''SELECT f.id, f.filename, u.username as owner, f.created_at
                        FROM files f
@@ -146,32 +155,39 @@ class FileManager:
             logger.error("Error listing shared files: %s", e, exc_info=True)
             return []
 
-    # Edit file content
     def edit_file(self, file_id: int, user_id: int, new_content: bytes) -> Tuple[bool, str]:
         try:
-            with self.user_manager._transaction() as cursor:
-                cursor.execute('SELECT encryption_key, owner_id FROM files WHERE id = ?', (file_id,))
+            with self.db.transaction() as cursor:
+                cursor.execute(
+                    'SELECT encryption_key, owner_id FROM files WHERE id = ?',
+                    (file_id,)
+                )
                 file_data = cursor.fetchone()
                 if not file_data:
                     return False, "File not found"
                 if file_data['owner_id'] != user_id:
                     return False, "You don't have permission to edit this file"
 
-                # Encrypt new content
                 key = b64decode(file_data['encryption_key'])
                 encrypted_data, _ = self.encryptor.encrypt_file_content(new_content, key)
-                cursor.execute('UPDATE files SET file_path = ? WHERE id = ?', (encrypted_data, file_id))
+                cursor.execute(
+                    'UPDATE files SET file_path = ? WHERE id = ?',
+                    (encrypted_data, file_id)
+                )
+
             self.user_manager._log_activity(user_id, 'EDIT', f"File {file_id} edited")
             return True, "File updated successfully"
         except Exception as e:
             logger.error("File edit error: %s", e, exc_info=True)
             return False, f"Failed to edit file: {e}"
 
-    # Delete a file
     def delete_file(self, file_id: int, user_id: int) -> Tuple[bool, str]:
         try:
-            with self.user_manager._transaction() as cursor:
-                cursor.execute('SELECT owner_id FROM files WHERE id = ?', (file_id,))
+            with self.db.transaction() as cursor:
+                cursor.execute(
+                    'SELECT owner_id FROM files WHERE id = ?',
+                    (file_id,)
+                )
                 file_data = cursor.fetchone()
                 if not file_data:
                     return False, "File not found"
@@ -180,6 +196,7 @@ class FileManager:
 
                 cursor.execute('DELETE FROM file_shares WHERE file_id = ?', (file_id,))
                 cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
+
             self.user_manager._log_activity(user_id, 'DELETE', f"File {file_id} deleted")
             return True, "File deleted successfully"
         except Exception as e:
